@@ -1,0 +1,12 @@
+[package]
+name = "rpixi"
+version = "0.1.0"
+authors = ["Stuart Haidon <serayen.sh@gmail.com>"]
+
+[dependencies]
+num = "0.1.40"
+piston_window = "0.71.1"
+image = "0.16.0"
+structopt = "0.1.1"
+structopt-derive = "0.1.1"
+rayon = "0.8.2"
