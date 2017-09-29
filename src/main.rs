@@ -12,6 +12,12 @@ use structopt::StructOpt;
 extern crate image;
 use image::{Rgba, Pixel};
 
+extern crate imageproc;
+use imageproc::drawing::draw_text_mut;
+
+extern crate rusttype;
+use rusttype::{FontCollection, Scale};
+
 type Pic = image::ImageBuffer<image::Rgba<u16>, std::vec::Vec<u16>>;
 
 #[derive(Debug, StructOpt)]
@@ -52,6 +58,7 @@ struct State {
     x: f64,
     y: f64,
     loop_count: u32,
+    color: Rgba<u16>,
     z: Complex64,
     finished: bool,
 }
@@ -75,14 +82,15 @@ fn get_rgba(hue: f64, sat: f64, val: f64) -> Rgba<u16> {
     }
 }
 
-fn mandelbrot(z: Complex64, x: f64, y: f64, cfg: &Config) -> (Complex64, Rgba<u16>) {
+fn mandelbrot(z: Complex64, x: f64, y: f64, cfg: &Config) -> Complex64 {
     let c = Complex64::new(x, y);
-    let zn = z.powf(cfg.power) + c;
+    z.powf(cfg.power) + c
+}
 
-    let mut color = get_rgba(cfg.colour_factor * 360.0 * (c.norm() / cfg.bounds).cos(), 1.0, 1.0);
+fn get_color(cfg: &Config, x: f64, y: f64) -> Rgba<u16> {
+    let mut color = get_rgba(cfg.colour_factor * 360.0 * (Complex64::new(x, y).norm() / cfg.bounds).cos(), 1.0, 1.0);
     color[3] = (cfg.opacity * u16::max_value() as f64) as u16;
-
-    (zn, color)
+    color
 }
 
 fn draw_point(image: &mut Pic, z: Complex64, color: Rgba<u16>, cfg: &Config) {
@@ -105,12 +113,14 @@ fn draw_point(image: &mut Pic, z: Complex64, color: Rgba<u16>, cfg: &Config) {
 
 fn draw_frame(state: &mut State, cfg: &Config, pic: &mut Pic) {
     for _ in 0..cfg.speed {
-        let (zn, color) = mandelbrot(state.z, state.x, state.y, &cfg);
+        let zn = mandelbrot(state.z, state.x, state.y, &cfg);
         state.z = zn;
-        draw_point(pic, state.z, color, &cfg);
+        draw_point(pic, state.z, state.color, &cfg);
         state.loop_count += 1;
 
-        if state.loop_count >= cfg.loop_limit {
+        let out_of_bounds = state.z.re.abs() > cfg.bounds && state.z.im.abs() > cfg.bounds;
+
+        if state.loop_count >= cfg.loop_limit || out_of_bounds {
             state.loop_count = 0;
             state.z = Complex64::new(0.0, 0.0);
 
@@ -120,6 +130,8 @@ fn draw_frame(state: &mut State, cfg: &Config, pic: &mut Pic) {
                 state.y += cfg.delta;
                 state.x = -cfg.bounds;
             }
+
+            state.color = get_color(&cfg, state.x, state.y);
         }
 
         if state.x >= cfg.bounds && state.y >= cfg.bounds {
@@ -151,19 +163,34 @@ fn main() {
     let mut buffer = image::ImageBuffer::new(cfg.width, cfg.height);
     let mut texture = Texture::from_image( &mut window.factory, &buffer, &TextureSettings::new()).expect("Error creating texture.");
 
+    let font = Vec::from(include_bytes!("SourceSansPro-Light.ttf") as &[u8]);
+    let font = FontCollection::from_bytes(font).into_font().unwrap();
+    let scale = Scale { x: 12.4 * 2.0, y: 12.4 };
+
     let mut state = State {
         x: -cfg.bounds,
         y: -cfg.bounds,
         loop_count: 0,
+        color: get_color(&cfg, -cfg.bounds, -cfg.bounds),
         z: Complex64::new(0.0, 0.0),
         finished: false,
     };
+    
+    let mut now = std::time::Instant::now();
+
+    let cfg_string = format!("{:#?}", cfg);
+    let cfg_string: Vec<_> = cfg_string.lines().enumerate().collect();
 
     while let Some(e) = window.next() {
         if let Some(_) = e.render_args() {
             if !state.finished {
                 draw_frame(&mut state, &cfg, &mut canvas);
                 u16_to_u8(&canvas, &mut buffer);
+                draw_text_mut(&mut buffer, Rgba([255, 255, 255, 255]), 10, 10, scale, &font, &format!("{:.*}% - {}s", 2, (state.y+cfg.bounds)/(cfg.bounds*2.0)*100.0, now.elapsed().as_secs()));
+
+                for &(i, l) in cfg_string.iter() {
+                    draw_text_mut(&mut buffer, Rgba([255, 255, 255, 255]), 10, 20 + i as u32*13, scale, &font, l);
+                }
             }
             texture.update(&mut window.encoder, &buffer).expect("Error flipping buffer");
             window.draw_2d(&e, |c,g| {
@@ -180,6 +207,7 @@ fn main() {
                     state.z = Complex64::new(0.0, 0.0);
                     state.loop_count = 0;
                     state.finished = false;
+                    now = std::time::Instant::now();
                 },
                 Button::Mouse(MouseButton::Right) => buffer.save("out.png").unwrap(),
                 _ => (),
