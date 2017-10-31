@@ -10,7 +10,7 @@ extern crate structopt_derive;
 use structopt::StructOpt;
 
 extern crate image;
-use image::{Rgba, Pixel};
+use image::{LumaA, Rgba};
 
 extern crate imageproc;
 use imageproc::drawing::draw_text_mut;
@@ -18,7 +18,17 @@ use imageproc::drawing::draw_text_mut;
 extern crate rusttype;
 use rusttype::{FontCollection, Scale};
 
-type Pic = image::ImageBuffer<image::Rgba<u16>, std::vec::Vec<u16>>;
+extern crate rayon;
+use rayon::prelude::*;
+
+extern crate itertools;
+use itertools::Itertools;
+
+use std::sync::{Arc, Mutex};
+use std::ops::DerefMut;
+
+type Pic<T> = image::ImageBuffer<image::LumaA<T>, std::vec::Vec<T>>;
+type SharedData<'a> = Arc<Mutex<(&'a mut Pic<u16>, &'a mut State)>>;
 
 #[derive(Debug, StructOpt)]
 struct Config {
@@ -34,11 +44,8 @@ struct Config {
     #[structopt(short="p", long="power", help="Power to use in the Mandelbrot equation", default_value = "2.0")]
     power: f64,
 
-    #[structopt(short="c", help="Multiplier on the hue", default_value = "0.7")]
-    colour_factor: f64,
-
-    #[structopt(short="o", help="Opacity of the drawn pixel", default_value = "0.8")]
-    opacity: f64,
+    #[structopt(short="f", long="factor", help="Exponent used to determine brightness curve", default_value = "50.0")]
+    factor: f64,
     
     #[structopt(short="z", long="zoom", default_value = "350")]
     zoom: u32,
@@ -49,51 +56,46 @@ struct Config {
     #[structopt(short="l", long="loops", help="Number of iterations for each coordinate", default_value = "200")]
     loop_limit: u32,
 
-    #[structopt(short="s", long="speed", help="Number of iterations per frame", default_value = "150")]
-    speed: u32,
+    #[structopt(long="re", help="Real offset", default_value = "0.0")]
+    off_real: f64,
+
+    #[structopt(long="im", help="Imaginary offset", default_value = "0.0")]
+    off_imaginary: f64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 struct State {
-    x: f64,
-    y: f64,
-    loop_count: u32,
-    color: Rgba<u16>,
-    z: Complex64,
-    finished: bool,
+    counter: usize,
+    max: usize,
+    just_finished: bool,
+    render_count: u8,
 }
 
-
-fn get_rgba(hue: f64, sat: f64, val: f64) -> Rgba<u16> {
+fn get_rgba(hue: f64, sat: f64, val: f64) -> Rgba<u8> {
     let hi = (hue/60.0).floor() % 6.0;
     let f = (hue/60.0) - (hue/60.0).floor();
     let p = val * (1.0 - sat);
     let q = val * (1.0 - f * sat);
     let t = val * (1.0 - (1.0-f) * sat);
 
-    match hi as u16 {
-        0 => Rgba([(u16::max_value() as f64 * val) as u16, (u16::max_value() as f64 * t) as u16,   (u16::max_value() as f64 * p) as u16,   u16::max_value()]),
-        1 => Rgba([(u16::max_value() as f64 * q) as u16,   (u16::max_value() as f64 * val) as u16, (u16::max_value() as f64 * p) as u16,   u16::max_value()]),
-        2 => Rgba([(u16::max_value() as f64 * p) as u16,   (u16::max_value() as f64 * val) as u16, (u16::max_value() as f64 * t) as u16,   u16::max_value()]),
-        3 => Rgba([(u16::max_value() as f64 * p) as u16,   (u16::max_value() as f64 * q) as u16,   (u16::max_value() as f64 * val) as u16, u16::max_value()]),
-        4 => Rgba([(u16::max_value() as f64 * t) as u16,   (u16::max_value() as f64 * p) as u16,   (u16::max_value() as f64 * val) as u16, u16::max_value()]),
-        5 => Rgba([(u16::max_value() as f64 * val) as u16, (u16::max_value() as f64 * p) as u16,   (u16::max_value() as f64 * q) as u16,   u16::max_value()]),
-        _ => Rgba([0,0,0,u16::max_value()])
+    match hi as u8 {
+        0 => Rgba([(255.0 * val) as u8, (255.0 * t) as u8,   (255.0 * p) as u8, 255]),
+        1 => Rgba([(255.0 * q) as u8,   (255.0 * val) as u8, (255.0 * p) as u8, 255]),
+        2 => Rgba([(255.0 * p) as u8,   (255.0 * val) as u8, (255.0 * t) as u8, 255]),
+        3 => Rgba([(255.0 * p) as u8,   (255.0 * q) as u8,   (255.0 * val) as u8, 255]),
+        4 => Rgba([(255.0 * t) as u8,   (255.0 * p) as u8,   (255.0 * val) as u8, 255]),
+        5 => Rgba([(255.0 * val) as u8, (255.0 * p) as u8,   (255.0 * q) as u8, 255]),
+        _ => Rgba([0,0,0,255])
     }
 }
+
 
 fn mandelbrot(z: Complex64, x: f64, y: f64, cfg: &Config) -> Complex64 {
     let c = Complex64::new(x, y);
     z.powf(cfg.power) + c
 }
 
-fn get_color(cfg: &Config, x: f64, y: f64) -> Rgba<u16> {
-    let mut color = get_rgba(cfg.colour_factor * 360.0 * (Complex64::new(x, y).norm() / cfg.bounds).cos(), 1.0, 1.0);
-    color[3] = (cfg.opacity * u16::max_value() as f64) as u16;
-    color
-}
-
-fn draw_point(image: &mut Pic, z: Complex64, color: Rgba<u16>, cfg: &Config) {
+fn draw_point(image: &mut Pic<u16>, z: Complex64, cfg: &Config) {
     let pos_x = (cfg.width as f64/2.0) + z.re * cfg.zoom as f64 - 0.5;
     let pos_y = (cfg.height as f64/2.0) - z.im * cfg.zoom as f64 + 0.5;
 
@@ -108,58 +110,63 @@ fn draw_point(image: &mut Pic, z: Complex64, color: Rgba<u16>, cfg: &Config) {
         return;
     }
 
-    image.get_pixel_mut(pos_x as u32, pos_y as u32).blend(&color);
+    let pixel = image.get_pixel_mut(pos_x as u32, pos_y as u32);
+    pixel[0] = pixel[0].saturating_add(1);
 }
 
-fn draw_frame(state: &mut State, cfg: &Config, pic: &mut Pic) {
-    for _ in 0..cfg.speed {
-        let zn = mandelbrot(state.z, state.x, state.y, &cfg);
-        state.z = zn;
-        draw_point(pic, state.z, state.color, &cfg);
-        state.loop_count += 1;
-
-        let out_of_bounds = state.z.re.abs() > cfg.bounds && state.z.im.abs() > cfg.bounds;
-
-        if state.loop_count >= cfg.loop_limit || out_of_bounds {
-            state.loop_count = 0;
-            state.z = Complex64::new(0.0, 0.0);
-
-            if state.x < cfg.bounds {
-                state.x += cfg.delta;
-            } else if state.y < cfg.bounds {
-                state.y += cfg.delta;
-                state.x = -cfg.bounds;
-            }
-
-            state.color = get_color(&cfg, state.x, state.y);
-        }
-
-        if state.x >= cfg.bounds && state.y >= cfg.bounds {
-            state.finished = true;
-            break;
-        }
-    }
-}
-
-fn u16_to_u8(from: &image::ImageBuffer<Rgba<u16>, Vec<u16>>, to: &mut image::ImageBuffer<Rgba<u8>, Vec<u8>> ) {
+fn u16_to_u8(from: &Pic<u16>, to: &mut image::ImageBuffer<Rgba<u8>, Vec<u8>>, factor: f64) {
     for ((_,_,p), (_,_,p2)) in from.enumerate_pixels().zip(to.enumerate_pixels_mut()) {
-        p2[3] = (p[3] >> 8) as u8;
-        p2[2] = (p[2] >> 8) as u8;
-        p2[1] = (p[1] >> 8) as u8;
-        p2[0] = (p[0] >> 8) as u8;
+        let p = p[0] as f64;
+        let val = 1.0 - ((-p)/factor).exp();
+        let c = (val * 255.0) as u8;
+
+        *p2 = Rgba([c,c,c,255]);
     }
 }
 
-fn main() {
-    let cfg = Config::from_args();
+fn iterate_coordinate(x: f64, y: f64, p_data: SharedData, cfg: &Config) {
+    let mut z = Complex64::new(cfg.off_real, cfg.off_imaginary);
+    // Skip the first value to get rid of the square.
+    z = mandelbrot(z, x, y, &cfg);
+    let mut points = vec![];
+
+    for _ in 0..cfg.loop_limit {
+        z = mandelbrot(z, x, y, &cfg);
+        points.push(z);
+    }
     
+    let mut pic = p_data.lock().expect("Lock failed");
+    let &mut (ref mut canvas, ref mut state) = pic.deref_mut();
+
+    for z in points {
+        draw_point(canvas, z, &cfg);
+    }
+
+    state.counter+=1;
+}
+
+fn output_buckets(canvas: &Pic<u16>) {
+    let step = 5000;
+    let mut buckets = vec![0;14];
+
+    for (_, _, p) in canvas.enumerate_pixels() {
+        if p[0] == 0 {
+            continue;
+        }
+        
+        buckets[(p[0] / step) as usize] += 1;
+    }
+
+    println!("{:#?}", buckets);
+}
+
+fn display(cfg: &Config, shared_pic: SharedData) {
     let mut window: PistonWindow = WindowSettings::new("Pixi", (cfg.width, cfg.height))
         .exit_on_esc(true)
         .opengl(OpenGL::V4_5)
         .build()
         .expect("Error creating window");
-
-    let mut canvas = image::ImageBuffer::from_pixel(cfg.width, cfg.height, Rgba([0,0,0,u16::max_value()]));
+    
     let mut buffer = image::ImageBuffer::new(cfg.width, cfg.height);
     let mut texture = Texture::from_image( &mut window.factory, &buffer, &TextureSettings::new()).expect("Error creating texture.");
 
@@ -167,31 +174,37 @@ fn main() {
     let font = FontCollection::from_bytes(font).into_font().unwrap();
     let scale = Scale { x: 12.4 * 2.0, y: 12.4 };
 
-    let mut state = State {
-        x: -cfg.bounds,
-        y: -cfg.bounds,
-        loop_count: 0,
-        color: get_color(&cfg, -cfg.bounds, -cfg.bounds),
-        z: Complex64::new(0.0, 0.0),
-        finished: false,
-    };
-    
-    let mut now = std::time::Instant::now();
-
     let cfg_string = format!("{:#?}", cfg);
     let cfg_string: Vec<_> = cfg_string.lines().enumerate().collect();
 
+    let mut factor = cfg.factor;
+    let now = std::time::Instant::now();
+    let mut force_rerender = false;
+
     while let Some(e) = window.next() {
         if let Some(_) = e.render_args() {
-            if !state.finished {
-                draw_frame(&mut state, &cfg, &mut canvas);
-                u16_to_u8(&canvas, &mut buffer);
-                draw_text_mut(&mut buffer, Rgba([255, 255, 255, 255]), 10, 10, scale, &font, &format!("{:.*}% - {}s", 2, (state.y+cfg.bounds)/(cfg.bounds*2.0)*100.0, now.elapsed().as_secs()));
+            let mut pic_data = shared_pic.lock().expect("Lock failed");
+            let &mut (ref canvas, ref mut state) = pic_data.deref_mut();
+
+            if force_rerender || (state.render_count == 30 && (!state.just_finished || state.counter != state.max)) {
+                u16_to_u8(&canvas, &mut buffer, factor);
+                draw_text_mut(&mut buffer, Rgba([255, 255, 255, 255]), 10, 10, scale, &font, &format!("{:.*}% - {}s", 2, (state.counter as f64)/(state.max as f64)*100.0, now.elapsed().as_secs()));
 
                 for &(i, l) in cfg_string.iter() {
                     draw_text_mut(&mut buffer, Rgba([255, 255, 255, 255]), 10, 20 + i as u32*13, scale, &font, l);
                 }
+
+                state.just_finished = state.counter == state.max;
+                state.render_count = 0;
+                force_rerender = false;
+
+                if state.just_finished {
+                    //output_buckets(&canvas);
+                }
             }
+
+            state.render_count += 1;
+
             texture.update(&mut window.encoder, &buffer).expect("Error flipping buffer");
             window.draw_2d(&e, |c,g| {
                 image(&texture, c.transform, g);
@@ -200,18 +213,44 @@ fn main() {
 
         if let Some(btn) = e.release_args() {
             match btn {
-                Button::Mouse(MouseButton::Left) => {
-                    canvas.enumerate_pixels_mut().for_each(|(_,_, p)| *p = Rgba([0,0,0,u16::max_value()]) );
-                    state.x = -cfg.bounds;
-                    state.y = -cfg.bounds;
-                    state.z = Complex64::new(0.0, 0.0);
-                    state.loop_count = 0;
-                    state.finished = false;
-                    now = std::time::Instant::now();
-                },
                 Button::Mouse(MouseButton::Right) => buffer.save("out.png").unwrap(),
                 _ => (),
             }
         }
+
+        if let Some(scroll) = e.mouse_scroll_args() {
+            if scroll[1] == -1.0 {
+                factor *= 2.0;
+                force_rerender = true;
+            } else if scroll[1] == 1.0 {
+                factor /= 2.0;
+                force_rerender = true;
+            }
+        }
     }
+
+    // Horrid hack to make both threads exit.
+    panic!("Exiting.");
+}
+
+fn main() {
+    let cfg = Config::from_args();
+
+    let mut canvas = image::ImageBuffer::from_pixel(cfg.width, cfg.height, LumaA([0,u16::max_value()]));
+
+    let coords: Vec<_> = (0_u32..).map(|x| -cfg.bounds + x as f64 * cfg.delta).take_while(|&x| x < cfg.bounds).collect();
+    let all_coords: Vec<_> = coords.iter().cartesian_product(coords.iter()).collect();
+
+    let mut state = State {
+        counter: 0,
+        max: all_coords.len(),
+        just_finished: false,
+        render_count: 0,
+    };
+
+    let shared_pic = Arc::new(Mutex::new((&mut canvas, &mut state)));
+
+    rayon::join(
+    || all_coords.par_iter().for_each(|&(&y, &x)| iterate_coordinate(x, y, shared_pic.clone(), &cfg) ),
+    || display(&cfg, shared_pic.clone()));
 }
